@@ -1,103 +1,236 @@
 #!/bin/bash
 set -euo pipefail
+exec > >(tee /var/log/user-data.log) 2>&1
+
+###############################################################################
+# n8n Workspace Corporativo - Bootstrap
+# - Multi-usuario nativo de n8n
+# - Postgres como contenedor en la misma EC2
+# - Postgres con bind configurable (localhost o público)
+# - SMTP para invitar al equipo
+# - Volumen EBS separado en /opt/n8n
+# - Caddy con HTTPS automático
+# - Backup diario con systemd timer
+###############################################################################
 
 FQDN="${fqdn}"
 TIMEZONE="${timezone}"
 DATA_DEVICE="${data_device}"
 DATA_MOUNT="/opt/n8n"
+POSTGRES_BIND="${postgres_bind}"
 
+echo "===== Bootstrap iniciado: $(date) ====="
+echo "FQDN: $FQDN"
+echo "Timezone: $TIMEZONE"
+echo "Postgres bind: $POSTGRES_BIND"
+
+# ============================================
+# Sistema base
+# ============================================
 timedatectl set-timezone "$TIMEZONE"
 dnf update -y
-dnf install -y docker
-dnf install -y curl --allowerasing
-dnf install -y amazon-ssm-agent xfsprogs
+dnf install -y docker curl xfsprogs amazon-ssm-agent --allowerasing
 
 systemctl enable amazon-ssm-agent
 systemctl start amazon-ssm-agent
 
+# ============================================
+# Docker Compose CLI plugin
+# ============================================
 mkdir -p /usr/local/lib/docker/cli-plugins
-curl -L "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+curl -L "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 systemctl enable docker
 systemctl start docker
 usermod -aG docker ec2-user
 
-# Espera a que el volumen de datos esté adjunto
+# ============================================
+# Detección y montaje del volumen EBS de datos
+# ============================================
+echo "Esperando volumen de datos en $DATA_DEVICE..."
 for i in {1..30}; do
   if [ -b "$DATA_DEVICE" ]; then
     break
   fi
-  # Intentar detectar dispositivos NVMe secundarios (ej. /dev/nvme1n1) si el alias /dev/xvdf no existe
   SECONDARY_NVME=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | grep nvme | grep -v nvme0n1 | head -n1 || true)
   if [ -n "$SECONDARY_NVME" ] && [ -b "$SECONDARY_NVME" ]; then
     DATA_DEVICE="$SECONDARY_NVME"
+    echo "Volumen detectado como $DATA_DEVICE"
     break
   fi
   sleep 2
 done
 
 if [ ! -b "$DATA_DEVICE" ]; then
-  echo "No se encontró el dispositivo de datos $DATA_DEVICE" >&2
+  echo "ERROR: No se encontró el dispositivo $DATA_DEVICE" >&2
   exit 1
 fi
 
 if ! blkid "$DATA_DEVICE"; then
+  echo "Formateando $DATA_DEVICE como XFS..."
   mkfs.xfs "$DATA_DEVICE"
 fi
 
 mkdir -p "$DATA_MOUNT"
+
 if ! grep -qs "$DATA_MOUNT" /etc/fstab; then
   echo "$DATA_DEVICE $DATA_MOUNT xfs defaults,nofail 0 2" >> /etc/fstab
 fi
+
 if ! mountpoint -q "$DATA_MOUNT"; then
   mount "$DATA_MOUNT"
 fi
+
 chown ec2-user:ec2-user "$DATA_MOUNT"
+
+# ============================================
+# Carpetas para datos persistentes en el EBS
+# ============================================
+mkdir -p "$DATA_MOUNT/postgres-data"
+mkdir -p "$DATA_MOUNT/n8n-data"
+mkdir -p "$DATA_MOUNT/caddy-data"
+mkdir -p "$DATA_MOUNT/caddy-config"
+mkdir -p "$DATA_MOUNT/backups"
+
+# Postgres en Docker corre como UID 999 (postgres user)
+chown -R 999:999 "$DATA_MOUNT/postgres-data"
+# n8n corre como UID 1000 (node user)
+chown -R 1000:1000 "$DATA_MOUNT/n8n-data"
 
 cd /opt/n8n
 
-cat <<"EOF" >/opt/n8n/docker-compose.yml
-version: "3.8"
+# ============================================
+# .env con valores inyectados desde Terraform
+# ============================================
+cat > /opt/n8n/.env <<EOF
+FQDN=${fqdn}
+TIMEZONE=${timezone}
+N8N_ENCRYPTION_KEY=${n8n_encryption_key}
+POSTGRES_BIND=${postgres_bind}
+
+# Postgres
+POSTGRES_USER=n8n
+POSTGRES_PASSWORD=${postgres_password}
+POSTGRES_DB=n8n
+
+# SMTP
+SMTP_HOST=${smtp_host}
+SMTP_PORT=${smtp_port}
+SMTP_USER=${smtp_user}
+SMTP_PASS=${smtp_pass}
+SMTP_SENDER=${smtp_sender}
+EOF
+chmod 600 /opt/n8n/.env
+
+# ============================================
+# docker-compose.yml
+# ============================================
+cat > /opt/n8n/docker-compose.yml <<'COMPOSE'
 services:
-  n8n:
-    image: n8nio/n8n:latest
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      - N8N_HOST=${fqdn}
-      - N8N_PROTOCOL=https
-      - N8N_PORT=5678
-      - WEBHOOK_URL=https://${fqdn}/
-      - N8N_EDITOR_BASE_URL=https://${fqdn}/
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=${n8n_basic_auth_user}
-      - N8N_BASIC_AUTH_PASSWORD=${n8n_basic_auth_pass}
-      - N8N_ENCRYPTION_KEY=${n8n_encryption_key}
-      - GENERIC_TIMEZONE=${timezone}
+      - POSTGRES_USER=$${POSTGRES_USER}
+      - POSTGRES_PASSWORD=$${POSTGRES_PASSWORD}
+      - POSTGRES_DB=$${POSTGRES_DB}
     ports:
-      - "127.0.0.1:5678:5678"
+      - "$${POSTGRES_BIND}:5432:5432"
     volumes:
-      - n8n_data:/home/node/.n8n
+      - /opt/n8n/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - n8n_net
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      # === Conexión / URL pública ===
+      - N8N_HOST=$${FQDN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://$${FQDN}/
+      - N8N_EDITOR_BASE_URL=https://$${FQDN}/
+      - GENERIC_TIMEZONE=$${TIMEZONE}
+      - TZ=$${TIMEZONE}
+
+      # === Seguridad ===
+      - N8N_ENCRYPTION_KEY=$${N8N_ENCRYPTION_KEY}
+      - N8N_SECURE_COOKIE=true
+      - N8N_PROXY_HOPS=1
+
+      # === Postgres (contenedor local, sin SSL) ===
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=$${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=$${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=$${POSTGRES_PASSWORD}
+
+      # === Multi-usuario corporativo ===
+      - N8N_USER_MANAGEMENT_DISABLED=false
+
+      # === SMTP para invitar miembros del equipo ===
+      - N8N_EMAIL_MODE=smtp
+      - N8N_SMTP_HOST=$${SMTP_HOST}
+      - N8N_SMTP_PORT=$${SMTP_PORT}
+      - N8N_SMTP_USER=$${SMTP_USER}
+      - N8N_SMTP_PASS=$${SMTP_PASS}
+      - N8N_SMTP_SENDER=$${SMTP_SENDER}
+      - N8N_SMTP_SSL=true
+
+      # === Performance / Pruning ===
+      - N8N_RUNNERS_ENABLED=true
+      - EXECUTIONS_MODE=regular
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336
+
+      # === Logs ===
+      - N8N_LOG_LEVEL=info
+    expose:
+      - "5678"
+    volumes:
+      - /opt/n8n/n8n-data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - n8n_net
+
   caddy:
-    image: caddy:2.7-alpine
+    image: caddy:2.8-alpine
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
+    environment:
+      - FQDN=$${FQDN}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/n8n/caddy-data:/data
+      - /opt/n8n/caddy-config:/config
     depends_on:
       - n8n
+    networks:
+      - n8n_net
 
-volumes:
-  n8n_data:
-  caddy_data:
-  caddy_config:
-EOF
+networks:
+  n8n_net:
+    driver: bridge
+COMPOSE
 
-cat <<"EOF" >/opt/n8n/Caddyfile
+# ============================================
+# Caddyfile
+# ============================================
+cat > /opt/n8n/Caddyfile <<CADDY
 %{ if trimspace(letsencrypt_email) != "" }
 {
   email ${letsencrypt_email}
@@ -105,10 +238,137 @@ cat <<"EOF" >/opt/n8n/Caddyfile
 %{ endif }
 ${fqdn} {
   encode zstd gzip
-  reverse_proxy n8n:5678
-}
-EOF
 
-chown -R ec2-user:ec2-user /opt/n8n
+  reverse_proxy n8n:5678 {
+    flush_interval -1
+    header_up Host {host}
+    header_up X-Real-IP {remote}
+    header_up X-Forwarded-For {remote}
+    header_up X-Forwarded-Proto {scheme}
+  }
+
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "strict-origin-when-cross-origin"
+  }
+
+  log {
+    output file /data/access.log
+    format json
+  }
+}
+CADDY
+
+# ============================================
+# Script de backup (Postgres en contenedor)
+# ============================================
+cat > /opt/n8n/backup.sh <<'BACKUP'
+#!/bin/bash
+set -e
+BACKUP_DIR="/opt/n8n/backups"
+mkdir -p "$BACKUP_DIR"
+TS=$(date +%Y%m%d_%H%M%S)
+cd /opt/n8n
+. .env
+
+# pg_dump dentro del contenedor de postgres
+/usr/bin/docker compose exec -T postgres \
+  pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" \
+  | gzip > "$BACKUP_DIR/n8n_$TS.sql.gz"
+
+# Retención: solo los últimos 7
+ls -t "$BACKUP_DIR"/n8n_*.sql.gz | tail -n +8 | xargs -r rm
+echo "Backup completado: $BACKUP_DIR/n8n_$TS.sql.gz"
+BACKUP
+
+chmod +x /opt/n8n/backup.sh
+chown -R ec2-user:ec2-user /opt/n8n/.env /opt/n8n/docker-compose.yml /opt/n8n/Caddyfile /opt/n8n/backup.sh
+
+# ============================================
+# Backup diario con systemd timer (AL2023 native)
+# ============================================
+cat > /etc/systemd/system/n8n-backup.service <<'SERVICE'
+[Unit]
+Description=n8n Postgres backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/opt/n8n
+ExecStart=/opt/n8n/backup.sh
+StandardOutput=append:/var/log/n8n-backup.log
+StandardError=append:/var/log/n8n-backup.log
+SERVICE
+
+cat > /etc/systemd/system/n8n-backup.timer <<'TIMER'
+[Unit]
+Description=Run n8n backup daily at 3am
+Requires=n8n-backup.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+touch /var/log/n8n-backup.log
+chown ec2-user:ec2-user /var/log/n8n-backup.log
+
+systemctl daemon-reload
+systemctl enable --now n8n-backup.timer
+
+echo "✓ Timer de backup activo"
+
+# ============================================
+# Levantar todo
+# ============================================
+cd /opt/n8n
+echo "Descargando imágenes..."
 /usr/bin/docker compose pull
+
+echo "Levantando contenedores..."
 /usr/bin/docker compose up -d
+
+echo "Esperando que Postgres inicie..."
+for i in {1..30}; do
+  if /usr/bin/docker compose exec -T postgres pg_isready -U n8n > /dev/null 2>&1; then
+    echo "✓ Postgres listo"
+    break
+  fi
+  sleep 3
+done
+
+echo "Esperando que n8n inicie..."
+for i in {1..30}; do
+  if /usr/bin/docker compose exec -T n8n wget -qO- http://localhost:5678/healthz > /dev/null 2>&1; then
+    echo "✓ n8n responde"
+    break
+  fi
+  sleep 3
+done
+
+echo ""
+echo "===== Bootstrap completado: $(date) ====="
+echo ""
+echo "n8n:"
+echo "  URL: https://${fqdn}"
+echo "  Crea la cuenta Owner y activa 2FA"
+echo ""
+echo "Postgres:"
+if [ "$POSTGRES_BIND" = "0.0.0.0" ]; then
+  echo "  ⚠ Expuesto en el puerto 5432 público"
+  echo "  Conecta tu gestor a: <EIP>:5432 con user=n8n / db=n8n"
+else
+  echo "  ✓ Solo accesible vía túnel SSH"
+  echo "  Desde tu laptop (en una terminal):"
+  echo "    ssh -i ${fqdn}-key.pem -L 5432:localhost:5432 ec2-user@<EIP> -N"
+  echo "  Luego conecta tu gestor a: localhost:5432 con user=n8n / db=n8n"
+fi
+echo ""

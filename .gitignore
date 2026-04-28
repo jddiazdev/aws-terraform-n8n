@@ -48,3 +48,7 @@ credenciales*.json
 # Documentation drafts (keep main project README)
 *.md
 !README.md
+
+*.pem
+n8n-dev-key
+n8n-key
