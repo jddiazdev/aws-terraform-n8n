@@ -185,10 +185,12 @@ services:
       - N8N_SMTP_USER=$${SMTP_USER}
       - N8N_SMTP_PASS=$${SMTP_PASS}
       - N8N_SMTP_SENDER=$${SMTP_SENDER}
-      - N8N_SMTP_SSL=true
+      - N8N_SMTP_SSL=false
+      - N8N_SMTP_STARTTLS=true
+      - N8N_TRUST_PROXY=true
+      - N8N_SECURE_COOKIE=true
 
       # === Performance / Pruning ===
-      - N8N_RUNNERS_ENABLED=true
       - EXECUTIONS_MODE=regular
       - EXECUTIONS_DATA_PRUNE=true
       - EXECUTIONS_DATA_MAX_AGE=336
